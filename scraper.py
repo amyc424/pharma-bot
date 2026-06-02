@@ -2,6 +2,7 @@ import os, json, hashlib, time, re, requests
 from bs4 import BeautifulSoup
 from difflib import SequenceMatcher
 from datetime import datetime
+import xml.etree.ElementTree as ET
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -9,17 +10,40 @@ SEEN_FILE = "seen_news.json"
 SIMILARITY_THRESHOLD = 0.75
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-SOURCES = [
-    {"name":"바이오뉴스","url":"https://www.thebionews.net/news/articleList.html?page=1&total=19488&box_idxno=&view_type=sm","article_selector":"ul.type2 li","title_selector":"dt a","link_selector":"dt a","base_url":"https://www.thebionews.net"},
-    {"name":"뉴스MP","url":"https://www.newsmp.com/news/articleList.html?sc_section_code=S1N6&view_type=sm","article_selector":"ul.type2 li","title_selector":"dt a","link_selector":"dt a","base_url":"https://www.newsmp.com"},
+# 우선순위 회사 & 키워드
+PRIORITY_COMPANIES = [
+    "삼성바이오로직스", "셀트리온", "SK바이오팜", "유한양행",
+    "한미약품", "대웅제약", "녹십자", "에스티팜", "HK이노엔"
+]
+PRIORITY_KEYWORDS = [
+    "기술이전", "적응증", "임상", "FDA", "IND", "NDA", "BLA",
+    "허가", "승인", "파이프라인", "Phase", "3상", "2상", "1상", "인수"
+]
+
+def is_priority(title):
+    for company in PRIORITY_COMPANIES:
+        if company in title:
+            for keyword in PRIORITY_KEYWORDS:
+                if keyword.lower() in title.lower():
+                    return True
+    return False
+
+# RSS 피드 소스
+RSS_SOURCES = [
+    {"name": "바이오뉴스", "url": "https://www.thebionews.net/rss/allArticle.xml"},
+    {"name": "히트뉴스", "url": "https://www.hitnews.co.kr/rss/allArticle.xml"},
+    {"name": "메디소비자뉴스", "url": "https://www.medisobizanews.com/rss/allArticle.xml"},
+    {"name": "뉴스MP", "url": "https://www.newsmp.com/rss/allArticle.xml"},
+    {"name": "FiercePharma", "url": "https://www.fiercepharma.com/rss/xml"},
+    {"name": "BiopharmaDive", "url": "https://www.biopharmadive.com/feeds/news/"},
+    {"name": "BioSpace", "url": "https://www.biospace.com/rss/news"},
+]
+
+# HTML 크롤링 소스 (RSS 없는 곳)
+HTML_SOURCES = [
     {"name":"약업닷컴","url":"https://www.yakup.com/news/index.html?cat=12&cat2=121","article_selector":"div.news_list li","title_selector":"a.news_title","link_selector":"a.news_title","base_url":"https://www.yakup.com"},
-    {"name":"바이오스펙테이터","url":"https://www.biospectator.com/section/section_list?MID=10000","article_selector":"div.article_list li","title_selector":"a.tit","link_selector":"a.tit","base_url":"https://www.biospectator.com"},
-    {"name":"한경바이오인사이트","url":"https://www.hankyung.com/bioinsight","article_selector":"li.news-item","title_selector":"h3 a","link_selector":"h3 a","base_url":"https://www.hankyung.com"},
-    {"name":"메디소비자뉴스","url":"https://www.medisobizanews.com/news/articleList.html?view_type=sm","article_selector":"ul.type2 li","title_selector":"dt a","link_selector":"dt a","base_url":"https://www.medisobizanews.com"},
-    {"name":"히트뉴스","url":"https://www.hitnews.co.kr/news/articleList.html?sc_sub_section_code=S2N17&view_type=sm","article_selector":"ul.type2 li","title_selector":"dt a","link_selector":"dt a","base_url":"https://www.hitnews.co.kr"},
-    {"name":"FiercePharma","url":"https://www.fiercepharma.com/","article_selector":"article","title_selector":"h3 a, h2 a","link_selector":"h3 a, h2 a","base_url":"https://www.fiercepharma.com"},
-    {"name":"BioSpace","url":"https://www.biospace.com/latest-news-press-releases","article_selector":"article","title_selector":"h3 a, h2 a","link_selector":"h3 a, h2 a","base_url":"https://www.biospace.com"},
-    {"name":"BiopharmaDive","url":"https://www.biopharmadive.com/topic/biotech/","article_selector":"article","title_selector":"h3 a, h2 a","link_selector":"h3 a, h2 a","base_url":"https://www.biopharmadive.com"},
+    {"name":"바이오스펙테이터","url":"https://www.biospectator.com/section/section_list?MID=10000","article_selector":"ul.article_list li","title_selector":"a.tit","link_selector":"a.tit","base_url":"https://www.biospectator.com"},
+    {"name":"한경바이오인사이트","url":"https://www.hankyung.com/bioinsight","article_selector":"div.article-list li","title_selector":"a","link_selector":"a","base_url":"https://www.hankyung.com"},
 ]
 
 def load_seen():
@@ -46,7 +70,27 @@ def is_duplicate(url, title, seen):
             return True
     return False
 
-def fetch_articles(source):
+def fetch_rss(source):
+    articles = []
+    try:
+        resp = requests.get(source["url"], headers=HEADERS, timeout=15)
+        root = ET.fromstring(resp.content)
+        items = root.findall(".//item")
+        for item in items[:20]:
+            title_el = item.find("title")
+            link_el = item.find("link")
+            if title_el is None or link_el is None:
+                continue
+            title = title_el.text or ""
+            url = link_el.text or ""
+            title = re.sub(r"<[^>]+>", "", title).strip()
+            if title and url:
+                articles.append({"title": title, "url": url, "source": source["name"]})
+    except Exception as e:
+        print(f"[RSS ERROR] {source['name']}: {e}")
+    return articles
+
+def fetch_html(source):
     articles = []
     try:
         resp = requests.get(source["url"], headers=HEADERS, timeout=15)
@@ -61,37 +105,66 @@ def fetch_articles(source):
             url = href if href.startswith("http") else source["base_url"] + (href if href.startswith("/") else "/" + href)
             articles.append({"title": title, "url": url, "source": source["name"]})
     except Exception as e:
-        print(f"[ERROR] {source['name']}: {e}")
+        print(f"[HTML ERROR] {source['name']}: {e}")
     return articles
 
 def send_telegram(text):
-    requests.post(
-        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
-        timeout=10
-    )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=10
+        )
+    except Exception as e:
+        print(f"[TELEGRAM ERROR] {e}")
 
 def main():
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] 시작")
     seen = load_seen()
-    new_articles = []
-    for source in SOURCES:
-        arts = fetch_articles(source)
+    priority_articles = []
+    normal_articles = []
+
+    for source in RSS_SOURCES:
+        arts = fetch_rss(source)
         print(f"  {source['name']}: {len(arts)}개")
         for art in arts:
             if not is_duplicate(art["url"], art["title"], seen):
-                new_articles.append(art)
+                if is_priority(art["title"]):
+                    priority_articles.append(art)
+                else:
+                    normal_articles.append(art)
                 seen["urls"].append(url_hash(art["url"]))
                 seen["titles"].append(art["title"].strip())
-        time.sleep(1)
-    print(f"새 기사: {len(new_articles)}개")
-    for art in new_articles[:30]:
-        send_telegram(f"💊 <b>[{art['source']}]</b>\n{art['title']}\n🔗 {art['url']}")
         time.sleep(0.5)
-    if len(new_articles) > 30:
-        send_telegram(f"ℹ️ 총 {len(new_articles)}개 중 30개만 전송했습니다.")
+
+    for source in HTML_SOURCES:
+        arts = fetch_html(source)
+        print(f"  {source['name']}: {len(arts)}개")
+        for art in arts:
+            if not is_duplicate(art["url"], art["title"], seen):
+                if is_priority(art["title"]):
+                    priority_articles.append(art)
+                else:
+                    normal_articles.append(art)
+                seen["urls"].append(url_hash(art["url"]))
+                seen["titles"].append(art["title"].strip())
+        time.sleep(0.5)
+
+    print(f"우선순위 기사: {len(priority_articles)}개, 일반 기사: {len(normal_articles)}개")
+
+    sent = 0
+    for art in priority_articles[:10]:
+        send_telegram(f"🔥 <b>[우선] [{art['source']}]</b>\n{art['title']}\n🔗 {art['url']}")
+        sent += 1
+        time.sleep(0.5)
+
+    for art in normal_articles[:20]:
+        send_telegram(f"💊 <b>[{art['source']}]</b>\n{art['title']}\n🔗 {art['url']}")
+        sent += 1
+        time.sleep(0.5)
+
+    print(f"완료: {sent}개 전송")
     save_seen(seen)
-    print("완료")
 
 if __name__ == "__main__":
     main()
